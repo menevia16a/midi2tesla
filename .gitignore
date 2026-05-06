@@ -1,2 +1,5 @@
 .venv
 midi2tesla.code-workspace
+*.mp3
+*.wav
+*.mid

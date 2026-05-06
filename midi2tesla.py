@@ -1,96 +1,89 @@
-"""midi2tesla.py  –  MIDI → Tesla-coil square-wave WAV converter
+"""midi2tesla.py  –  MIDI → Tesla-coil square-wave MP3 converter
 
 Usage:
-    python midi2tesla.py <input.mid>
+    python midi2tesla.py <input.mid> [output.mp3]
 
 Output:
-    <input>.wav  (16-bit PCM, mono, 44100 Hz)
+    <input>.mp3  (mono, 44100 Hz, 128 kbps)
 
 Design goals
 ────────────
 • Monophonic output: only the single most prominent note plays at any time.
-  Tesla coils cannot produce overlapping tones cleanly; polyphony produces
-  static and obscures the melody.
+  Tesla coils produce static with polyphony; the melody note always wins.
 
-• Fixed duty cycle: all notes are rendered at the same pulse width fraction
-  regardless of original velocity, so perceived volume is consistent.
-  Velocity is used only to rank note importance during overlap resolution.
+• 50% duty-cycle square wave: produces a proper audible tone on any speaker
+  or audio device, and drives a Tesla coil interrupter at the correct firing
+  rate.  All notes play at maximum amplitude (velocity is ignored for volume).
 
-• Intelligent note priority: when multiple notes overlap, the winner is chosen
-  by (1) highest velocity, (2) melodic range bonus (MIDI 60–84), (3) highest
-  pitch.  When the winner changes mid-note, a seamless switch is emitted so
-  the melody stays in front and the song remains recognisable.
+• Full tempo-map support: all set_tempo events are honoured.
 
-• Full tempo-map support: all set_tempo events across all tracks are honoured,
-  including mid-song tempo changes.
+• Pitch-bend and sustain-pedal (CC 64) are tracked per channel.
 
-• Drum channel (9) is excluded from output.
-
-• Pitch-bend messages are tracked per channel and applied to the active note's
-  frequency.
-
-• Rolling duty-cycle safety limiter prevents coil overheating during
-  dense passages.
+• Note articulation gap: a short silence is trimmed from the tail of each
+  note so that repeated notes sound distinct rather than blurring together.
 """
 
 import sys
 import os
 import time as _time
+import collections
 import numpy as np
 import mido
-import soundfile as sf
+import lameenc
 
 # ── Tuning parameters ──────────────────────────────────────────────────────────
-SAMPLE_RATE    = 44100      # Hz
-A3_REF_HZ      = 220.0      # Hz for MIDI note 57 (A3).
-                            # Combined with the /2 period trick below, this
-                            # produces the correct pitch (tested empirically).
+SAMPLE_RATE   = 44100   # Hz
+DUTY_FRACTION = 0.5     # 50% duty cycle – proper square wave, full amplitude
+MP3_BITRATE   = 128     # kbps
 
-DUTY_FRACTION  = 0.04       # Fraction of one period that the pulse is HIGH.
-                            # 4 % gives a clean, audible tone.  Raise for more
-                            # apparent volume; lower for less coil stress.
-MIN_PULSE_SAMP = 2          # Hard floor: pulse never shorter than this many samples
-MAX_PULSE_SAMP = 12         # Hard ceiling: pulse never longer than this many samples
+# Melody priority range – notes here always beat bass/sub-bass when resolving
+# polyphony.  Covers the human-voice / lead-instrument zone.
+MELODY_LO = 55          # G3 (~196 Hz)
+MELODY_HI = 84          # C6 (~1047 Hz)
 
-# Rolling coil-safety limiter ─────────────────────────────────────────────────
-# If the rolling-average duty cycle in any SAFETY_WINDOW-sample window exceeds
-# SAFETY_DUTY_MAX, the output is zeroed for those samples.  This prevents the
-# coil from drawing excessive power during very dense passages.
-SAFETY_DUTY_MAX = 0.45      # 45 % rolling-average ceiling
-SAFETY_WINDOW   = 1000      # rolling window length in samples
+# Note articulation gap: samples trimmed from the end of every rendered note
+# so that consecutive identical notes sound distinct.
+NOTE_GAP_SAMP = 220     # ~5 ms at 44100 Hz
 
-DRUM_CHANNEL = 9            # 0-indexed MIDI drum channel – excluded from output
 
-# ── Frequency / period helpers ─────────────────────────────────────────────────
+# ── Frequency helpers ──────────────────────────────────────────────────────────
 
-def note_to_period(note: int, pitch_bend_semitones: float = 0.0) -> int:
+def note_to_freq(note: int, bend: float = 0.0) -> float:
+    """Standard equal-temperament frequency for a MIDI note (A4 = 440 Hz)."""
+    return 440.0 * 2.0 ** ((note + bend - 69) / 12.0)
+
+
+def note_to_period(note: int, bend: float = 0.0) -> int:
+    """Period in samples for a MIDI note. Returns 0 for sub-20 Hz notes."""
+    freq = note_to_freq(note, bend)
+    if freq < 20.0:
+        return 0
+    return max(2, int(SAMPLE_RATE / freq))
+
+
+# ── Note priority ──────────────────────────────────────────────────────────────
+
+def note_priority(note: int, velocity: int, track_idx: int) -> int:
     """
-    Return the half-period (samples) for a MIDI note with optional pitch bend.
+    Score a note for prominence when resolving polyphony.  Higher = keep.
 
-    The /2 in the denominator is intentional: it compensates for A3_REF_HZ
-    being 220 (one octave below A4=440) while MIDI note 69 should map to A4.
-    Together they produce the correct perceived pitch.
+    Melody-range notes (MELODY_LO–MELODY_HI) always beat bass notes.
+    Within a band, higher pitch wins; velocity and track index break ties.
     """
-    freq = A3_REF_HZ * 2.0 ** ((note + pitch_bend_semitones - 69) / 12.0)
-    return max(2, int(SAMPLE_RATE / freq / 2))
-
-
-def pulse_width_for_period(period: int) -> int:
-    """Compute on-time samples for a given period, clamped to safe bounds."""
-    return max(MIN_PULSE_SAMP, min(MAX_PULSE_SAMP, int(period * DUTY_FRACTION)))
+    if MELODY_LO <= note <= MELODY_HI:
+        band = 1_000_000
+    elif note > MELODY_HI:
+        band = 700_000 - (note - MELODY_HI) * 1_000
+    else:
+        band = 200_000 + note * 5_000
+    return band + note * 500 + velocity * 100 + max(0, (16 - min(track_idx, 16))) * 50
 
 
 # ── MIDI parsing ───────────────────────────────────────────────────────────────
 
 def build_tempo_map(mid: mido.MidiFile) -> list:
-    """
-    Scan every track for set_tempo events and build a sorted tempo map.
-
-    Returns a list of (abs_tick, tempo_µs_per_beat) tuples, starting at tick 0.
-    If multiple set_tempo events land on the same tick (e.g. in different
-    tracks), the last one wins (standard behaviour).
-    """
-    events: dict = {0: 500_000}   # default: 120 BPM
+    """Build a sorted list of (abs_tick, tempo_µs) from all tracks."""
+    events: dict = {0: 500_000}
     for track in mid.tracks:
         abs_tick = 0
         for msg in track:
@@ -100,133 +93,110 @@ def build_tempo_map(mid: mido.MidiFile) -> list:
     return sorted(events.items())
 
 
-def tick_to_sample(abs_tick: int, ticks_per_beat: int, tempo_map: list) -> int:
-    """
-    Convert an absolute MIDI tick to an absolute audio sample index.
-
-    Correctly accounts for all tempo changes up to abs_tick.
-    """
+def tick_to_sample(abs_tick: int, tpb: int, tempo_map: list) -> int:
+    """Convert an absolute MIDI tick to an audio sample index."""
     sample = 0.0
     prev_tick, prev_tempo = 0, 500_000
     for map_tick, map_tempo in tempo_map:
         if abs_tick <= map_tick:
             break
-        sample += (
-            mido.tick2second(map_tick - prev_tick, ticks_per_beat, prev_tempo)
-            * SAMPLE_RATE
-        )
+        sample += mido.tick2second(map_tick - prev_tick, tpb, prev_tempo) * SAMPLE_RATE
         prev_tick, prev_tempo = map_tick, map_tempo
-    sample += (
-        mido.tick2second(abs_tick - prev_tick, ticks_per_beat, prev_tempo)
-        * SAMPLE_RATE
-    )
+    sample += mido.tick2second(abs_tick - prev_tick, tpb, prev_tempo) * SAMPLE_RATE
     return int(sample)
-
-
-def note_priority(note: int, velocity: int) -> int:
-    """
-    Score a note for prominence when resolving polyphony.  Higher = keep.
-
-    Priority order:
-      1. Velocity (loudest note is most important).
-      2. Melodic range: MIDI 60–84 (middle C to C5) gets a bonus since the
-         melody almost always lives here.  Notes above 84 get a smaller bonus.
-      3. Pitch as tiebreaker: higher pitch wins (melody sits above bass).
-    """
-    if 60 <= note <= 84:
-        range_bonus = 200
-    elif note > 84:
-        range_bonus = 100
-    else:
-        range_bonus = 0
-    return velocity * 10_000 + range_bonus + note
 
 
 def collect_mono_events(mid: mido.MidiFile) -> tuple:
     """
-    Parse all MIDI tracks, resolve polyphony, and return a flat list of
+    Merge all MIDI tracks into a monophonic timeline of
+    (sample_index, 'on'|'off', note_number) events.
 
-        (sample_index, 'on' | 'off', note_number)
-
-    describing a *strictly monophonic* note sequence.
-
-    Algorithm
-    ─────────
-    All events from all tracks are merged into a single timeline sorted by
-    absolute tick.  A set of "active notes" is maintained; at every event the
-    highest-priority active note is re-evaluated.  If the winner changes, an
-    'off' for the outgoing note and an 'on' for the incoming note are emitted
-    at that exact sample.  This ensures seamless melody-over-accompaniment
-    behaviour and clean note transitions.
-
-    Pitch-bend messages are tracked per channel; the active note's period is
-    adjusted accordingly during synthesis.
+    All channels are included.  Polyphony is resolved at every event by
+    keeping the highest-priority note.  Sustain pedal and pitch bend are
+    tracked per channel.
     """
     tpb       = mid.ticks_per_beat
     tempo_map = build_tempo_map(mid)
 
-    # ── Collect all relevant messages with absolute tick times ────────────────
     raw: list = []
-    for track in mid.tracks:
+    for track_idx, track in enumerate(mid.tracks):
         abs_tick = 0
         for msg in track:
             abs_tick += msg.time
-            if msg.type in ('note_on', 'note_off', 'pitchwheel'):
-                raw.append((abs_tick, msg))
+            if msg.type in ('note_on', 'note_off', 'pitchwheel', 'control_change'):
+                raw.append((abs_tick, msg, track_idx))
     raw.sort(key=lambda x: x[0])
 
-    # ── Simulate polyphony and emit monophonic transitions ───────────────────
-    active: dict = {}        # note → {'velocity': int, 'channel': int}
-    pitch_bends: dict = {}   # channel → semitone offset (float)
-    current_note = None      # the note currently outputting
-    mono: list = []          # result: (sample, 'on'|'off', note)
-    pitch_bend_map: dict = {}  # note → semitone bend at time of 'on' event
+    active: dict      = {}   # note → {velocity, channel, track_idx}
+    sustained: dict   = {}   # channel → set of notes deferred by pedal
+    pedal_down: dict  = {}   # channel → bool
+    pitch_bends: dict = {}   # channel → semitones
+    pitch_bend_map: dict = {}
+    current_note      = None
+    mono: list        = []
 
-    def best_note():
+    def best():
         if not active:
             return None
-        return max(active, key=lambda n: note_priority(n, active[n]['velocity']))
+        return max(active, key=lambda n: note_priority(
+            n, active[n]['velocity'], active[n]['track_idx']))
 
-    def emit_transition(sample: int, new_note) -> None:
+    def emit(sample: int, new_note) -> None:
         nonlocal current_note
         if new_note == current_note:
             return
         if current_note is not None:
             mono.append((sample, 'off', current_note))
         if new_note is not None:
-            bend = pitch_bends.get(active[new_note]['channel'], 0.0)
-            pitch_bend_map[new_note] = bend
+            pitch_bend_map[new_note] = pitch_bends.get(active[new_note]['channel'], 0.0)
             mono.append((sample, 'on', new_note))
         current_note = new_note
 
-    for abs_tick, msg in raw:
-        if msg.channel == DRUM_CHANNEL:
-            continue
+    def handle_note_off(note: int, channel: int, sample: int) -> None:
+        if pedal_down.get(channel, False):
+            if note in active:
+                sustained.setdefault(channel, set()).add(note)
+        else:
+            active.pop(note, None)
+            sustained.get(channel, set()).discard(note)
+        emit(sample, best())
 
+    for abs_tick, msg, track_idx in raw:
         sample = tick_to_sample(abs_tick, tpb, tempo_map)
 
         if msg.type == 'note_on':
             if msg.velocity == 0:
-                # Velocity-0 note_on is equivalent to note_off (MIDI spec)
-                active.pop(msg.note, None)
+                handle_note_off(msg.note, msg.channel, sample)
             else:
-                active[msg.note] = {'velocity': msg.velocity, 'channel': msg.channel}
-            emit_transition(sample, best_note())
+                if note_to_freq(msg.note) >= 20.0:
+                    active[msg.note] = {
+                        'velocity' : msg.velocity,
+                        'channel'  : msg.channel,
+                        'track_idx': track_idx,
+                    }
+                emit(sample, best())
 
         elif msg.type == 'note_off':
-            active.pop(msg.note, None)
-            emit_transition(sample, best_note())
+            handle_note_off(msg.note, msg.channel, sample)
+
+        elif msg.type == 'control_change' and msg.control == 64:
+            ch = msg.channel
+            if msg.value >= 64:
+                pedal_down[ch] = True
+            else:
+                pedal_down[ch] = False
+                for note in list(sustained.get(ch, set())):
+                    active.pop(note, None)
+                sustained.pop(ch, None)
+                emit(sample, best())
 
         elif msg.type == 'pitchwheel':
-            # pitch value: −8192 to +8191; map to ±2 semitones
             semitones = msg.pitch / 4096.0
             pitch_bends[msg.channel] = semitones
-            # If the currently playing note is on this channel, update its bend
-            if current_note is not None and current_note in active:
-                if active[current_note]['channel'] == msg.channel:
-                    pitch_bend_map[current_note] = semitones
+            if (current_note is not None and current_note in active
+                    and active[current_note]['channel'] == msg.channel):
+                pitch_bend_map[current_note] = semitones
 
-    # Emit final note-off at the tail
     if current_note is not None and raw:
         tail = tick_to_sample(raw[-1][0], tpb, tempo_map) + SAMPLE_RATE // 4
         mono.append((tail, 'off', current_note))
@@ -238,23 +208,19 @@ def collect_mono_events(mid: mido.MidiFile) -> tuple:
 
 def synthesize(mono_events: list, pitch_bend_map: dict) -> np.ndarray:
     """
-    Render the monophonic note event list into a float32 square-wave buffer.
+    Render the monophonic note event list as 50% duty-cycle square waves.
 
-    Every note is rendered at a fixed duty cycle (DUTY_FRACTION of its period),
-    independent of the original MIDI velocity.  This gives consistent perceived
-    volume across all notes and eliminates the static caused by mixing
-    different pulse widths.
-
-    Pitch-bend offsets stored in pitch_bend_map are applied per note.
+    Every note plays at maximum amplitude regardless of original velocity.
+    A NOTE_GAP_SAMP silence is trimmed from the end of each note segment
+    so that consecutive identical notes sound distinct.
     """
     if not mono_events:
         return np.zeros(0, dtype=np.float32)
 
-    total_samples = mono_events[-1][0] + SAFETY_WINDOW + SAMPLE_RATE // 4
+    total_samples = mono_events[-1][0] + SAMPLE_RATE
     music = np.zeros(total_samples, dtype=np.float32)
 
-    # Pair on/off events into (start_sample, end_sample, note) segments
-    pending: dict = {}
+    pending: dict  = {}
     segments: list = []
     for sample, etype, note in mono_events:
         if etype == 'on':
@@ -265,75 +231,111 @@ def synthesize(mono_events: list, pitch_bend_map: dict) -> np.ndarray:
         segments.append((start, total_samples, note))
 
     for start, end, note in segments:
-        length = end - start
+        play_end = max(start, end - NOTE_GAP_SAMP)
+        length   = play_end - start
         if length <= 0:
             continue
-        bend   = pitch_bend_map.get(note, 0.0)
-        period = note_to_period(note, bend)
-        pw     = pulse_width_for_period(period)
 
-        # Build one period then tile it to cover the full segment length
-        one_period = np.zeros(period, dtype=np.float32)
-        one_period[:pw] = 1.0
-        repeats = length // period + 2
-        tiled   = np.tile(one_period, repeats)
-        music[start:end] = tiled[:length]
+        period = note_to_period(note, pitch_bend_map.get(note, 0.0))
+        if period == 0:
+            continue
+        pw = max(1, int(period * DUTY_FRACTION))
+
+        one_period       = np.zeros(period, dtype=np.float32)
+        one_period[:pw]  = 1.0
+        tiled            = np.tile(one_period, length // period + 2)
+        music[start:play_end] = tiled[:length]
 
     return music
 
 
-# ── Post-processing ────────────────────────────────────────────────────────────
+# ── MP3 output ─────────────────────────────────────────────────────────────────
 
-def safety_limiter(music: np.ndarray) -> np.ndarray:
-    """
-    Rolling duty-cycle safety limiter.
+def save_mp3(music: np.ndarray, path: str) -> None:
+    """Normalise to full scale and write an MP3 file via lameenc."""
+    peak = float(np.max(np.abs(music)))
+    if peak > 0:
+        music = music / peak
 
-    Zeros out any samples in windows where the rolling-average duty cycle
-    exceeds SAFETY_DUTY_MAX.  This protects the coil from overheating during
-    passages where many short high-frequency notes would push average power up.
-    """
-    kernel = np.ones(SAFETY_WINDOW, dtype=np.float32) / SAFETY_WINDOW
-    avg    = np.convolve(music, kernel, mode='valid')   # length = N − W + 1
-    mask   = (avg < SAFETY_DUTY_MAX).astype(np.float32)
-    return music[:len(mask)] * mask
+    samples_int16 = (music * 32767.0).astype(np.int16)
+
+    enc = lameenc.Encoder()
+    enc.set_bit_rate(MP3_BITRATE)
+    enc.set_in_sample_rate(SAMPLE_RATE)
+    enc.set_channels(1)
+    enc.set_quality(2)   # 2 = highest quality
+
+    mp3_data  = enc.encode(samples_int16.tobytes())
+    mp3_data += enc.flush()
+
+    with open(path, 'wb') as fh:
+        fh.write(mp3_data)
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main() -> None:
     if len(sys.argv) < 2:
-        print("Usage: python midi2tesla.py <input.mid>")
+        print("Usage: python midi2tesla.py <input.mid> [output.mp3]")
         sys.exit(1)
 
     input_path  = sys.argv[1]
-    output_path = os.path.splitext(input_path)[0] + ".wav"
+    output_path = sys.argv[2] if len(sys.argv) >= 3 else \
+                  os.path.splitext(input_path)[0] + ".mp3"
 
     t0 = _time.monotonic()
 
     print(f"Loading   {input_path}")
     mid = mido.MidiFile(input_path)
-    print(f"  ticks/beat : {mid.ticks_per_beat}")
-    print(f"  tracks     : {len(mid.tracks)}")
+    print(f"  type={mid.type}  ticks/beat={mid.ticks_per_beat}  tracks={len(mid.tracks)}")
+
+    ch_stats: dict = collections.defaultdict(lambda: {'notes': 0, 'vel': [], 'pitches': []})
+    ch_track: dict = {}
+    for ti, track in enumerate(mid.tracks):
+        for msg in track:
+            if msg.type == 'note_on' and msg.velocity > 0:
+                ch = msg.channel
+                ch_stats[ch]['notes']    += 1
+                ch_stats[ch]['vel'].append(msg.velocity)
+                ch_stats[ch]['pitches'].append(msg.note)
+                if ch not in ch_track:
+                    ch_track[ch] = (ti, track.name.strip())
+    print("  Channel summary:")
+    for ch in sorted(ch_stats.keys()):
+        s = ch_stats[ch]
+        ti, tname = ch_track.get(ch, (0, ''))
+        v, p = s['vel'], s['pitches']
+        mel_pct = sum(1 for x in p if MELODY_LO <= x <= MELODY_HI) * 100 // len(p)
+        print(f"    ch{ch:2d}  track[{ti:2d}] {tname[:12]:12s}  "
+              f"{s['notes']:5d} notes  vel {min(v)}-{max(v)}  "
+              f"pitch {min(p)}-{max(p)} "
+              f"({note_to_freq(min(p)):.0f}-{note_to_freq(max(p)):.0f} Hz)  "
+              f"melody-range {mel_pct}%")
+    print()
 
     print("Building monophonic timeline …")
     mono, pitch_bend_map = collect_mono_events(mid)
     note_segments = sum(1 for _, e, _ in mono if e == 'on')
     print(f"  {note_segments} note segments after polyphony reduction")
 
+    if mono:
+        selected = [n for _, e, n in mono if e == 'on']
+        if selected:
+            print(f"  Selected pitch range: MIDI {min(selected)}-{max(selected)}  "
+                  f"({note_to_freq(min(selected)):.0f}-{note_to_freq(max(selected)):.0f} Hz)")
+
     if not mono:
         print("No playable notes found.  Exiting.")
         sys.exit(1)
 
-    print("Synthesising square-wave pulses …")
+    print("Synthesising square-wave audio …")
     music = synthesize(mono, pitch_bend_map)
-    duration = len(music) / SAMPLE_RATE
-    print(f"  {duration:.2f} s  ({len(music)} samples)")
+    duration    = len(music) / SAMPLE_RATE
+    actual_duty = float(np.mean(music))
+    print(f"  {duration:.2f} s  ({len(music)} samples)  avg duty={actual_duty*100:.1f}%")
 
-    print("Applying safety duty-cycle limiter …")
-    music = safety_limiter(music)
-
-    print(f"Saving    {output_path}")
-    sf.write(output_path, music, SAMPLE_RATE, subtype='PCM_16')
+    print(f"Encoding  {output_path}  ({MP3_BITRATE} kbps) …")
+    save_mp3(music, output_path)
 
     elapsed = _time.monotonic() - t0
     print(f"Done in {elapsed:.1f} s.")
